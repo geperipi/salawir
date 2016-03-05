@@ -1,0 +1,424 @@
+create or replace PACKAGE BODY           PKG_ROTS AS
+  
+  procedure parse_voucher(
+    p_file_id number,
+    p_bucket_type varchar2,
+    p_user  varchar2,
+    p_evt_id  varchar2
+  ) AS
+  cursor c_file(cp_file_id number) is
+    select 
+    MIME_TYPE, BLOB_CONTENT, FILENAME, DBMS_LOB.GETLENGTH(blob_content) v_length, PROCESS_STATUS
+    from v_doc where atp_file_reff_id=cp_file_id
+  ;
+  
+  
+  d_file c_file%rowtype;
+  cursor c_event(cp_file_id number) is
+    select * from atp_parameter_event 
+    where vcr_fileid=cp_file_id or vcr_fileid2=cp_file_id
+  ;
+  d_event c_event%rowtype;
+  
+  v_position        NUMBER:=1;
+  c_chunk_len   number       := 1;
+  v_raw_chunk       RAW(32767);
+  v_char      CHAR(1);
+  v_line        VARCHAR2 (32767)        := NULL;
+  V_Seq Number;
+  v_count number:=0;
+  
+  V_TOT_STOCK NUMBER:=0;
+  v_mod_loc NUMBER;
+  v_dvd_loc NUMBER;
+  v_tot_loc NUMBER;
+
+
+  BEGIN
+    /* TODO implementation required */
+    -- Read data from wwv_flow_files</span>
+    open c_file(p_file_id);
+    fetch c_file into d_file;
+    close c_file;
+    
+    select count(1) into v_tot_loc 
+  from ATP_QUOTA_LOC where evt_id=p_evt_id;
+  
+    
+    -- Read data from event
+    open c_event(p_file_id);
+    fetch c_event into d_event;
+    close c_event;
+    
+    --get seq_id next
+    select nvl(max(seq_id),0)+1 into v_seq from atp_voucher_bucket where evt_id=d_event.evt_id and bucket_type=p_bucket_type;
+    
+    --proses hanya jika statusnya masih 0
+    if d_file.process_status=0 then
+      WHILE ( v_position <= d_file.v_length ) LOOP
+        v_raw_chunk := dbms_lob.substr(d_file.blob_content,c_chunk_len,v_position);
+        v_char := chr(hex_to_decimal(rawtohex(v_raw_chunk)));
+        v_line := v_line || v_char;
+        
+        IF v_char = CHR(10) or v_position=d_file.v_length THEN
+          v_line := regexp_replace(v_line, '[[:space:]]*','');
+          if v_line is not null then
+            --insert ke table voucher
+            insert into atp_voucher_bucket (
+              Evt_Id,
+              EVT_GROUP_ID,
+              PROGRAM_ID,
+              SEQ_ID,
+              BUCKET_TYPE,
+              Voucher_Code,
+              Status,
+              created_date,
+              created_by
+            ) values (
+              D_Event.Evt_Id,
+              d_event.evt_group_id,
+              d_event.program_id,
+              v_seq,
+              p_bucket_type,
+              V_Line,
+              'A',
+              Sysdate,
+              v('APP_USER')
+            );
+--            dbms_output.put_line(v_line);
+            V_Seq := V_Seq + 1;
+            v_count := v_count + 1;
+          end if;
+          v_line := '';
+        END IF;
+
+        v_position := v_position + c_chunk_len;
+      END LOOP;
+    End If;
+  
+  --update  atp_quota_loc
+  IF v_tot_loc<>0  THEN
+  v_mod_loc:=TO_NUMBER(mod(v_count,v_tot_loc));  --5,2 =1
+  v_dvd_loc:=TO_NUMBER(floor(v_count/v_tot_loc)); --5/2=2
+  end if;
+  
+  IF V_COUNT >=1 THEN
+  if v_tot_loc=1 then
+    update atp_quota_loc set 
+    stock=(select stock from atp_quota_loc where evt_id=p_evt_id)+v_count,
+    modified_date=sysdate,
+    modified_by=p_user,
+    default_stock=(select stock from atp_quota_loc where evt_id=p_evt_id)+v_count
+    where evt_id=p_evt_id;
+  
+  else 
+    if v_count>=v_tot_loc  then   
+        if v_mod_loc <>0 then
+            for i in (select evt_id,stock,default_stock,location_id from atp_quota_loc where evt_id=p_evt_id)
+            loop
+              update atp_quota_loc set 
+              stock=i.stock+v_dvd_loc,
+                modified_date=sysdate,
+                modified_by=p_user,
+                default_stock=i.stock+v_dvd_loc
+                where evt_id=p_evt_id and location_id=i.location_id;
+            end loop;
+            
+            for j in (select evt_id,stock,default_stock,location_id from atp_quota_loc where evt_id=p_evt_id and rownum<=v_mod_loc) loop
+              update atp_quota_loc 
+              set stock=j.stock+1,
+                  default_stock=j.stock+1
+                  where evt_id=p_evt_id and location_id=j.location_id;
+            end loop;
+        else
+            for i in (select evt_id,stock,default_stock,location_id from atp_quota_loc where evt_id=p_evt_id)
+            loop
+              update atp_quota_loc
+              set stock=i.stock+v_dvd_loc,
+              default_stock=i.stock+v_dvd_loc
+                where evt_id=p_evt_id and location_id=i.location_id;
+            end loop;
+        
+        end if;
+        
+      else
+      for k in (select evt_id,stock,default_stock,location_id from atp_quota_loc where evt_id=p_evt_id and rownum<=v_count) loop
+        update atp_quota_loc
+        set stock=k.stock+1,
+          default_stock=k.stock+1
+          where evt_id=p_evt_id and location_id=k.location_id;
+      end loop;
+       end if; 
+  END IF;
+  END IF;
+  
+    apex_application.g_print_success_message := 'Data berhasil disimpan, '||v_count||' Kode Voucher berhasil diupload';
+  END parse_voucher;
+  
+  FUNCTION get_bp_name 
+  (
+    p_bpf_id IN number
+  ) RETURN varchar2 AS 
+    cursor c_bp(c_bpf_id number) is
+      select * from atp_business_process a
+      join atp_business_process_flow b
+        on a.bp_id=b.bp_id
+      where 
+      b.bpf_id=c_bpf_id;
+    d_bp c_bp%rowtype;
+  BEGIN
+    open c_bp(p_bpf_id);
+    fetch c_bp into d_bp;
+    close c_bp;
+    
+    RETURN d_bp.bp_name;
+  END get_bp_name;
+  
+  FUNCTION get_next_task 
+  (
+    p_bpf_id IN number,
+    p_bpt_id in number
+  ) RETURN EMPARRAY as
+    cursor c_next_bpf(c_bpf_id number,c_bpt_id number) is
+      select a.*,b.bpt_id,b.bp_name from atp_business_process_flow a
+        join atp_business_process b
+          on a.bp_id=b.bp_id
+      where a.bp_id=
+        (select bpf_next_bp_id from atp_business_process_flow 
+        where bpf_id=c_bpf_id)
+          and b.bpt_id=c_bpt_id
+      ;
+    d_next_bpf c_next_bpf%rowtype;
+    
+    l_data EmpArray := EmpArray();
+  BEGIN 
+    open c_next_bpf(p_bpf_id,p_bpt_id);
+    fetch c_next_bpf into d_next_bpf;
+    close c_next_bpf;
+    
+    l_data.extend(4);
+    l_data(1) := d_next_bpf.bpt_id;
+    l_data(2) := d_next_bpf.bpf_id;
+    l_data(3) := d_next_bpf.bp_name;
+    
+    return l_data;
+  END;
+  
+  FUNCTION get_prev_task 
+  (
+    p_bpf_id IN number,
+    p_bpt_id in number
+  ) RETURN EMPARRAY as
+    cursor c_next_bpf(c_bpf_id number,c_bpt_id number) is
+      select a.*,b.bpt_id,b.bp_name from atp_business_process_flow a
+        join atp_business_process b
+          on a.bp_id=b.bp_id
+      where a.bp_id=
+        (select bpf_prev_bp_id from atp_business_process_flow 
+        where bpf_id=c_bpf_id)
+          and b.bpt_id=c_bpt_id
+      ;
+    d_next_bpf c_next_bpf%rowtype;
+    
+    l_data EmpArray := EmpArray();
+  BEGIN 
+    open c_next_bpf(p_bpf_id,p_bpt_id);
+    fetch c_next_bpf into d_next_bpf;
+    close c_next_bpf;
+    
+    l_data.extend(4);
+    l_data(1) := d_next_bpf.bpt_id;
+    l_data(2) := d_next_bpf.bpf_id;
+    l_data(3) := d_next_bpf.bp_name;
+    
+    return l_data;
+  END;
+  
+  procedure save_workflow(
+    p_evt_id  varchar2,
+    p_nik varchar2
+  ) as
+    xtf_id  number;
+    xtf_id2  number;
+    next_data EMPARRAY;
+  begin
+    --simpan workflow status
+    select nvl(max(tf_id),0)+1 into xtf_id from atp_transaction_flow;
+    insert into atp_transaction_flow(
+      TF_ID,
+      EVT_ID,
+      BPT_ID,
+      BPF_ID,
+      TF_STATUS,
+      TF_GROUP_ID,
+      TF_CREATED_DATE,
+      TF_CREATED_BY
+    )
+    values (
+      xtf_id,
+      p_evt_id,
+      g_bpt_id,
+      1,--hardcode awal workflow
+      get_bp_name(1),
+      xtf_id,
+      sysdate,
+      p_nik
+    );
+    
+    --insert next workflow
+    select nvl(max(tf_id),0)+1 into xtf_id2 from atp_transaction_flow;
+    next_data := get_next_task(1,g_bpt_id);
+    insert into atp_transaction_flow(
+      TF_ID,
+      EVT_ID,
+      BPT_ID,
+      BPF_ID,
+      TF_STATUS,
+      TF_GROUP_ID
+    )
+    values (
+      xtf_id2,
+      P_EVT_ID,
+      next_data(1),
+      next_data(2),
+      get_bp_name(next_data(2)),
+      xtf_id
+    );
+    
+    --update event
+    update atp_parameter_event set status=2,
+    flow_status=next_data(3)
+    where evt_id=p_evt_id
+    ;
+    
+    --update lelang
+    update atp_parameter_lelang set status=2,
+    flow_status=next_data(3)
+    Where Evt_Id=P_Evt_Id
+    ;
+    
+    --insert logs
+    atp_logs.insert_logs('atp_parameter_event/atp_parameter_lelang',6,'Data dengan Id '||p_evt_id||' berhasil diconfirm ke pusat');
+  end;
+  
+  procedure approve_workflow(
+    p_type  varchar2,
+    p_evt_id  varchar2,
+    p_nik varchar2
+  ) as
+    cursor c_get_flow(cp_evt_id varchar2) is
+      select * from (
+        select evt_id,bpt_id,bpf_id from atp_transaction_flow
+        where evt_id=cp_evt_id
+        order by tf_id desc
+      ) where rownum=1
+    ;
+    d_get_flow c_get_flow%rowtype;
+    next_data EMPARRAY;
+    prev_data EMPARRAY;
+    Xtf_Id  Number;
+    Req   Utl_Http.Req;
+    resp  utl_http.resp;
+    Req1   Utl_Http.Req;
+    resp1  utl_http.resp;
+  begin
+    --update flownya
+    select nvl(max(tf_id),0) into xtf_id from atp_transaction_flow where evt_id=p_evt_id;
+    update atp_transaction_flow set
+      TF_CREATED_DATE=sysdate,
+      TF_CREATED_BY=p_nik
+    where tf_id=xtf_id;
+    
+    --get flow
+    open c_get_flow(p_evt_id);
+    fetch c_get_flow into d_get_flow;
+    close c_get_flow;
+    
+    next_data := get_next_task(d_get_flow.bpf_id,d_get_flow.bpt_id);
+    
+    --insert next workflow
+    if next_data(1) is not null then
+      --create next flow
+      select nvl(max(tf_id),0)+1 into xtf_id from atp_transaction_flow;
+      insert into atp_transaction_flow(
+        TF_ID,
+        EVT_ID,
+        BPT_ID,
+        BPF_ID,
+        TF_STATUS,
+        TF_GROUP_ID,
+        TF_CREATED_DATE,
+        TF_CREATED_BY
+      )
+      values (
+        xtf_id,
+        P_EVT_ID,
+        next_data(1),
+        next_data(2),
+        get_bp_name(next_data(2)),
+        xtf_id,
+        sysdate,
+        p_nik
+      );
+    else --approve jika sudah habis
+      if p_type='ROTS' then
+        update atp_parameter_event set status=1,flow_status='APPROVED'
+        where evt_id=p_evt_id;
+        
+        --update keyword
+        Update Atp_Keywords Set Status=1 Where Evt_Id_Reff=P_Evt_Id; commit;
+        Req := Utl_Http.Begin_Request('http://10.250.195.53:8247/poincache/mgrcache?command=keyword');
+        Resp := Utl_Http.Get_Response(Req);
+        utl_http.end_response(resp);
+        
+        Req1 := Utl_Http.Begin_Request('http://10.251.38.125:8247/poincache/mgrcache?command=keyword');
+        Resp1 := Utl_Http.Get_Response(Req1);
+        utl_http.end_response(resp1);
+      elsif p_type='LELANG' then
+        update atp_parameter_lelang set status=1,flow_status='APPROVED'
+        Where Evt_Id=P_Evt_Id;
+        
+         --update keyword
+        Update Atp_Keywords Set Status=1 Where Evt_Id_Reff=P_Evt_Id;  commit;
+        Req := Utl_Http.Begin_Request('http://10.250.195.53:8247/poincache/mgrcache?command=keyword');
+        Resp := Utl_Http.Get_Response(Req);
+        utl_http.end_response(resp);
+        
+         Req1 := Utl_Http.Begin_Request('http://10.251.38.125:8247/poincache/mgrcache?command=keyword');
+         Resp1 := Utl_Http.Get_Response(Req1);
+         utl_http.end_response(resp1);
+      end if;
+      --insert logs
+    atp_logs.insert_logs('atp_parameter_event/atp_parameter_lelang',7,'Data dengan Id '||p_evt_id||' berhasil diapprove');
+    end if;
+    commit;
+  end;
+  
+  --fungsi untuk check nomor telkomsel by delimiter ;
+  function Check_Tsel_Number(
+    P_Headstand In Varchar2
+  ) return boolean is
+   Cnt_Loop Number;
+   Xvar Varchar2(32767) := P_Headstand;
+   V_Msisdn Varchar2(50);
+   X_Valid Varchar2(50);
+   v_error boolean:=true;
+  Begin
+    Select nvl(Length(xvar)-Length(Replace(xvar,';')),1)+1 Into Cnt_Loop From Dual;
+   For I In 1..Cnt_Loop Loop
+    Select Get_Delimitedtext(Xvar,';',I) Into V_Msisdn From Dual;
+    If V_Msisdn Is Not Null Then
+      Begin
+        Select 1 Into X_Valid From Atp_Cust_Prefix Where Prefix=Substr(Trim_Msisdn(V_Msisdn),1,3) and rownum=1;
+        Exception When Others Then
+          v_error := false;
+      end;
+    end if;
+   End Loop;
+   If P_Headstand IS NOT NULL Then
+     return v_error;
+   else
+     return true;
+   End If;
+  end;
+END PKG_ROTS;
